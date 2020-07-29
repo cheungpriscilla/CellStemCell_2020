@@ -1,0 +1,494 @@
+---
+title: "Bulk-RNAseq-analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tximport)
+library(biomaRt)
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(fgsea)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+```
+
+# ApcKO Time Course Analysis #
+```{r, eval=T}
+# List all directories containing data  
+samples_timecourse <- list.files(path = "data/", full.names = T, pattern=".sf")
+
+# Acquire mouse Ensembl transcript ids, gene symbols, and entrez gene ids from BioMart database
+tx2gene <- getBM(attributes= c("ensembl_transcript_id","ensembl_gene_id", "external_gene_name"),
+                     mart = useDataset("mmusculus_gene_ensembl", useMart("ensembl")))
+
+# Acquire length-scaled transcripts per million from salmon quant files
+txi <- tximport(samples_timecourse, type="salmon", tx2gene=tx2gene[,c("ensembl_transcript_id", "ensembl_gene_id")], countsFromAbundance="lengthScaledTPM", ignoreTxVersion = T)
+
+# Create treatment sample matrix
+tcourse_rnaseq <- data.frame(treatment = c("0h 1", "0h 2", "12h 1", "12h 2", "24h 1", "24h 2", "72h 1", "72h 2", "96h 1", "96h 2"),
+                         time = factor(c(0, 0, 12, 12, 24, 24, 72, 72, 96, 96)),
+                          row.names = paste0("X",1:10))
+
+# Create DESEqDataSet object
+tcourse_dds <- DESeqDataSetFromTximport(txi, colData = tcourse_rnaseq, design = ~time)
+
+# Apply variance stabilizing transformation to count data
+tcourse_vst <- assay(varianceStabilizingTransformation(tcourse_dds))
+```
+
+
+```{r, eval=T, fig.width=2, fig.height=1.5}
+# Perform principal component analysis - Figure S4H
+tcourse_pc <- prcomp(t(tcourse_vst))
+ggplot(data.frame(tcourse_pc$x, Sample=tcourse_rnaseq[colnames(tcourse_vst),1], Time=tcourse_rnaseq[colnames(tcourse_vst),2], Name=colnames(tcourse_vst)), aes(PC1, PC2)) + 
+  geom_point(aes(colour = Time), size=3)  + theme_classic() + xlab(paste0("PC1 (", 100*summary(tcourse_pc)$importance[2,1], "% of variance)")) + ylab(paste0("PC2 (", 100*summary(tcourse_pc)$importance[2,2], "% of variance)")) + geom_vline(xintercept=0, lty=3, color="red")  + geom_hline(yintercept=0, lty=3, color="red") #  + geom_text_repel(aes(label=Name))
+```
+
+
+```{r, eval=T, fig.height=3, fig.width=5}
+# Generate heatmap for expression of indicated genes over time course - Figure 4G
+genes <- as.data.frame(c("Cldn4", "Ccn2", "Amotl2", "Ankrd1", "Ccn1", "Lgr5", "Axin2", "Tcf7", "Fosl1", "Fzd9", "S100a6", "Ly6a", "S100a11", "Anxa2"))
+gene_sig <- merge(genes, gene_id, by.x=1, by.y=2)
+gene_sig <- tcourse_vst[gene_sig$ensembl_gene_id,]
+gene_sig <- merge(gene_sig, gene_id, by.x=0, by.y=1)
+row.names(gene_sig) <- gene_sig[,"external_gene_name"]
+gene_sig <- gene_sig[match(genes$`c("Cldn4", "Ccn2", "Amotl2", "Ankrd1", "Ccn1", "Lgr5", "Axin2", "Tcf7", "Fosl1", "Fzd9", "S100a6", "Ly6a", "S100a11", "Anxa2")`, gene_sig$external_gene_name),]
+gene_sig <- gene_sig[,-c(1,12,13)]
+colnames(gene_sig) <- tcourse_rnaseq$treatment
+
+timecourse.heatmap <- pheatmap(gene_sig, fontsize = 18, cluster_cols = F, scale="row", cluster_rows = F)
+#ggsave(filename = "timecourse.tiff", plot = timecourse.heatmap)
+```
+
+
+# Comparison between ApcKO 72h and 0h #
+```{r, eval=T}
+# Acquire length-scaled transcripts per million from salmon quant files
+txi3 <- tximport(samples_timecourse[c(1,2,7,8)], type="salmon", tx2gene=tx2gene[,c("ensembl_transcript_id", "ensembl_gene_id")], countsFromAbundance="lengthScaledTPM", ignoreTxVersion = T)
+
+# Create treatment sample matrix
+tcourse_rnaseq3 <- data.frame(treatment = c("0h 1", "0h 2", "72h 1", "72h 2"),
+                         time = factor(c(0, 0, 72, 72)),
+                          row.names = paste0("X",1:4))
+
+# Create DESEqDataSet object
+tcourse_dds3 <- DESeqDataSetFromTximport(txi3, colData = tcourse_rnaseq3, design = ~time)
+
+# Apply variance stabilizing transformation to count data
+tcourse_vst3 <- assay(varianceStabilizingTransformation(tcourse_dds3))
+
+# Estimate size factors
+tcourse_dds3 <- estimateSizeFactors(tcourse_dds3)
+
+# Perform differential expression analysis based on negative binomial distribution
+tcourse_dds3 <- DESeq(tcourse_dds3)
+
+# Extract shrunken shrunken log2 fold changes
+tcourse_72_results_shrunk <- lfcShrink(tcourse_dds3, contrast=c("time", "72", "0"), 
+                                 res=results(tcourse_dds3,contrast=c("time", "72", "0"), independentFiltering = F, cooksCutoff = Inf))
+tcourse_72_results_shrunk <- data.frame(tcourse_72_results_shrunk)
+tcourse_72_results_shrunk <- merge(tcourse_72_results_shrunk, tx2gene[!duplicated(tx2gene[,c(2,3)]),c(2,3)], by.x=0, by.y=1)
+```
+
+
+# Comparison between ApcKO 24h and 0h #
+```{r, eval=T}
+# Acquire length-scaled transcripts per million from salmon quant files
+txi4 <- tximport(samples_timecourse[c(1,2,5,6)], type="salmon", tx2gene=tx2gene[,c("ensembl_transcript_id", "ensembl_gene_id")], countsFromAbundance="lengthScaledTPM", ignoreTxVersion = T)
+
+# Create treatment sample matrix
+tcourse_rnaseq4 <- data.frame(treatment = c("0h 1", "0h 2", "24h 1", "24h 2"),
+                         time = factor(c(0, 0, 24, 24)),
+                          row.names = paste0("X",1:4))
+
+# Create DESeqDataSet object
+tcourse_dds4 <- DESeqDataSetFromTximport(txi4, colData = tcourse_rnaseq4, design = ~time)
+
+# Apply variance stabilizing transformation to count data
+tcourse_vst4 <- assay(varianceStabilizingTransformation(tcourse_dds4))
+
+# Estimate size factors
+tcourse_dds4 <- estimateSizeFactors(tcourse_dds4)
+
+# Perform differential expression analysis based on negative binomial distribution
+tcourse_dds4 <- DESeq(tcourse_dds4)
+
+# Extract shrunken shrunken log2 fold changes
+tcourse_24_results_shrunk <- lfcShrink(tcourse_dds4, contrast=c("time", "24", "0"), 
+                                 res=results(tcourse_dds4,contrast=c("time", "24", "0"), independentFiltering = F, cooksCutoff = Inf))
+tcourse_24_results_shrunk <- data.frame(tcourse_24_results_shrunk)
+tcourse_24_results_shrunk <- merge(tcourse_24_results_shrunk, tx2gene[!duplicated(tx2gene[,c(2,3)]),c(2,3)], by.x=0, by.y=1)
+```
+
+
+# Comparison between AKP +/-Dox D3 #
+```{r, eval=T}
+# List all directories containing data  
+samples_AKPD3 <- list.files(path = "data_AKPD3/", full.names = T, pattern=".sf")
+
+# Acquire length-scaled transcripts per million from salmon quant files
+txi5 <- tximport(samples_AKPD3, type="salmon", tx2gene=tx2gene[,c("ensembl_transcript_id", "ensembl_gene_id")], countsFromAbundance="lengthScaledTPM", ignoreTxVersion = T)
+
+# Create treatment sample matrix
+AKP_rnaseq <- data.frame(samples = c("AKP1", "AKP2", "AKP4", "AKP5"),
+                         treatment = factor(c(0, 0, 1, 1)),
+                          row.names = paste0("X",1:4))
+
+# Create DESeqDataSet object
+AKP_dds <- DESeqDataSetFromTximport(txi5, colData = AKP_rnaseq, design = ~ treatment)
+
+# Apply variance stabilizing transformation to count data
+AKP_vst <- assay(varianceStabilizingTransformation(AKP_dds))
+
+# Estimate size factors
+AKP_dds <- estimateSizeFactors(AKP_dds)
+
+# Perform differential expression analysis based on negative binomial distribution
+AKP_dds <- DESeq(AKP_dds)
+
+# Extract shrunken shrunken log2 fold changes
+AKP_results_shrunk <- lfcShrink(AKP_dds, contrast=c("treatment", "1", "0"), 
+                                 res=results(AKP_dds,contrast=c("treatment", "1", "0"), independentFiltering = F, cooksCutoff = Inf))
+AKP_results_shrunk <- data.frame(AKP_results_shrunk)
+AKP_results_shrunk <- merge(AKP_results_shrunk, tx2gene[!duplicated(tx2gene[,c(2,3)]),c(2,3)], by.x=0, by.y=1)
+```
+
+
+# Generating ranked gene lists by entrez id for GSEA #
+```{r, eval=T}
+# ApcKO 72h vs 0h
+tcourse_72_results_entrez <- merge(tcourse_72_results_shrunk, gene_id[,c(1,3)], by.x=1, by.y=1)
+tcourse_72_results_entrez <- subset(tcourse_72_results_entrez, !is.na(entrezgene_id))
+tcourse_72_results_entrez <- subset(tcourse_72_results_entrez, !is.na(log2FoldChange))
+tcourse_72_results_entrez <- tcourse_72_results_entrez[order(tcourse_72_results_entrez$padj),]
+tcourse_72_results_entrez <- tcourse_72_results_entrez[!duplicated(tcourse_72_results_entrez$entrezgene_id),] # keep more significant duplicate
+tcourse_72.ranks <- tcourse_72_results_entrez$log2FoldChange
+names(tcourse_72.ranks) <- tcourse_72_results_entrez$entrezgene_id
+tcourse_72.ranks <- sort(tcourse_72.ranks, decreasing = TRUE)
+
+# ApcKO 24h vs 0h
+tcourse_24_results_entrez <- merge(tcourse_24_results_shrunk, gene_id[,c(1,3)], by.x=1, by.y=1)
+tcourse_24_results_entrez <- subset(tcourse_24_results_entrez, !is.na(entrezgene_id))
+tcourse_24_results_entrez <- subset(tcourse_24_results_entrez, !is.na(log2FoldChange))
+tcourse_24_results_entrez <- tcourse_24_results_entrez[order(tcourse_24_results_entrez$padj),]
+tcourse_24_results_entrez <- tcourse_24_results_entrez[!duplicated(tcourse_24_results_entrez$entrezgene_id),] # keep more significant duplicate
+tcourse_24.ranks <- tcourse_24_results_entrez$log2FoldChange
+names(tcourse_24.ranks) <- tcourse_24_results_entrez$entrezgene_id
+tcourse_24.ranks <- sort(tcourse_24.ranks, decreasing = TRUE)
+
+# AKP +Dox D3 vs -Dox D3
+AKP_results_entrez <- merge(AKP_results_shrunk, gene_id[,c(1,3)], by.x=1, by.y=1)
+AKP_results_entrez <- subset(AKP_results_entrez, !is.na(entrezgene_id))
+AKP_results_entrez <- subset(AKP_results_entrez, !is.na(log2FoldChange))
+#AKP_results_entrez <- AKP_results_entrez[,-c(1,8)] %>% group_by(entrezgene_id) %>% summarise_all(mean) %>% as.data.frame()
+AKP_results_entrez <- AKP_results_entrez[order(AKP_results_entrez$padj),]
+AKP_results_entrez <- AKP_results_entrez[!duplicated(AKP_results_entrez$entrezgene_id),] # keep more significant duplicate
+AKP.ranks <- AKP_results_entrez$log2FoldChange
+names(AKP.ranks) <- AKP_results_entrez$entrezgene_id
+AKP.ranks <- sort(AKP.ranks, decreasing = TRUE)
+```
+
+
+# Gene Set Enrichment Analysis - KEGG Pathways #
+```{r, eval=T}
+# Retrieve mouse KEGG pathways from KEGG database 
+library(KEGGREST)
+path <- gsub("mmu:","",keggLink("mmu","pathway"))
+path <- data.frame(pathway=names(path), gene=as.character(path))
+path <- split(as.character(path$gene), path$pathway)
+
+substrLeft <- function(x, n){
+  substr(x, 1, nchar(x)-n)
+}
+
+p <- c()
+for(i in 1:(length(path) %/% 10)){
+  p <- c(p, sapply(keggGet(names(path)[(i*10-9):(i*10)]), "[[", "NAME"))
+}
+i <- i + 1
+p <- c(p, sapply(keggGet(names(path)[(i*10-9):((i*10-9) + length(path) %% 10 - 1)]), "[[", "NAME"))
+p <- substrLeft(p,23)
+names(path) <- p
+```
+
+
+```{r, eval=T}
+# Perform gene set enrichment analysis on KEGG pathways
+set.seed(5)
+
+fgsea_72kegg <- fgsea(path, tcourse_72.ranks, nperm=10000, maxSize=500)
+fgsea_24kegg <- fgsea(path, tcourse_24.ranks, nperm=10000, maxSize=500)
+AKP_fgsea_kegg <- fgsea(path, AKP.ranks, nperm=10000, maxSize=500)
+
+fgsea_72kegg <- fgsea_72kegg[order(fgsea_72kegg$padj),]
+fgsea_24kegg <- fgsea_24kegg[order(fgsea_24kegg$padj),]
+AKP_fgsea_kegg <- AKP_fgsea_kegg[order(AKP_fgsea_kegg$padj),]
+
+fgsea_72kegg$pathway <- factor(fgsea_72kegg$pathway, levels=rev(unique(fgsea_72kegg$pathway[order(fgsea_72kegg$NES)])))
+fgsea_24kegg$pathway <- factor(fgsea_24kegg$pathway, levels=rev(unique(fgsea_24kegg$pathway[order(fgsea_24kegg$NES)])))
+AKP_fgsea_kegg$pathway <- factor(AKP_fgsea_kegg$pathway, levels=rev(unique(AKP_fgsea_kegg$pathway[order(AKP_fgsea_kegg$NES)])))
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=4}
+# ApcKO 72h vs 0h - Figure 4J
+ggplot(subset(fgsea_72kegg[c(11,17,28,60,92),]), aes(y = NES, x = pathway)) + 
+  geom_segment(yend=0, aes(xend=pathway), lty=3) + theme_classic() + ylab("Normalized Enrichment Score") + 
+  geom_point(aes(size=size, color=(pval)))  +
+  xlab("Significant KEGG Pathways at 72h") + coord_flip() + 
+  theme(legend.position = "right", axis.text = element_text(vjust=0.5, size = 14),
+        axis.title=element_text(size=16), legend.text = element_text(size = 12), legend.title = element_text(size = 14)) +
+  guides(size=guide_legend(title="Gene Set Size")) +
+  scale_color_continuous(low="red", high="blue", name="p-value", trans = "log",
+                         breaks=c(0.02, 0.002, 0.0002)) +
+  ylim(c(0,2)) + geom_hline(yintercept=0, lwd=0.1)
+```
+
+```{r, eval=T, fig.height=2, fig.width=3.5}
+# ApcKO 24h vs 0h - Figure S4J
+ggplot(subset(fgsea_24kegg[c(24,69,76),]), aes(y = NES, x = pathway)) + 
+  geom_segment(yend=0, aes(xend=pathway), lty=3) + theme_classic() + ylab("Normalized Enrichment Score") + 
+  geom_point(aes(size=size, color=(pval)))  +
+  xlab("Significant KEGG Pathways at 24h") + coord_flip() + 
+  theme(legend.position = "right", axis.text = element_text(vjust=0.5, size = 14),
+        axis.title=element_text(size=16), legend.text = element_text(size = 12), legend.title = element_text(size = 14)) +
+  guides(size=guide_legend(title="Gene Set Size")) +
+  scale_color_continuous(low="red", high="blue", name="p-value", trans = "log",
+                         breaks=c(0.03, 0.01, 0.003)) +
+  ylim(c(-2,2)) + geom_hline(yintercept=0, lwd=0.1) #+
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=5}
+# AKP +Dox D3 vs -Dox D3 - Figure 5D
+ggplot(subset(AKP_fgsea_kegg[c(2,3,10,12,13,31,40,44,47),]), aes(y = NES, x = pathway)) + 
+  geom_segment(yend=0, aes(xend=pathway), lty=3) + theme_classic() + ylab("Normalized Enrichment Score") + 
+  geom_point(aes(size=size, color=(pval)))  +
+  xlab("Significant KEGG Pathways") + coord_flip() + 
+  theme(legend.position = "right", axis.text = element_text(vjust=0.5, size = 14),
+        axis.title=element_text(size=16), legend.text = element_text(size = 12), legend.title = element_text(size = 14)) +
+  guides(size=guide_legend(title="Gene Set Size")) +
+  scale_color_continuous(low="red", high="blue", name="p-value", trans = "log",
+                         breaks=c(0.02, 0.002, 0.0002)) +
+  ylim(c(-2,2)) + geom_hline(yintercept=0, lwd=0.1) #+
+```
+
+
+# Generating ranked gene lists by gene symbol for GSEA #
+```{r, eval=TRUE}
+# ApcKO 72h vs 0h
+tcourse_72_results_shrunk <- subset(tcourse_72_results_shrunk, !is.na(log2FoldChange))
+tcourse_72_results_shrunk <- tcourse_72_results_shrunk[order(tcourse_72_results_shrunk$padj),]
+tcourse_72_results_shrunk_uniq <- tcourse_72_results_shrunk[!duplicated(tcourse_72_results_shrunk$external_gene_name),] # keep more significant duplicate
+foldchanges72 <- tcourse_72_results_shrunk_uniq$log2FoldChange
+names(foldchanges72) <- tcourse_72_results_shrunk_uniq$external_gene_name
+foldchanges72 <- sort(foldchanges72, decreasing = TRUE)
+
+# ApcKO 24h vs 0h
+tcourse_24_results_shrunk <- subset(tcourse_24_results_shrunk, !is.na(log2FoldChange))
+tcourse_24_results_shrunk <- tcourse_24_results_shrunk[order(tcourse_24_results_shrunk$padj),]
+tcourse_24_results_shrunk_uniq <- tcourse_24_results_shrunk[!duplicated(tcourse_24_results_shrunk$external_gene_name),]
+foldchanges24 <- tcourse_24_results_shrunk_uniq$log2FoldChange
+names(foldchanges24) <- tcourse_24_results_shrunk_uniq$external_gene_name
+foldchanges24 <- sort(foldchanges24, decreasing = TRUE)
+
+# AKP +Dox D3 vs -Dox D3
+AKP_results_shrunk <- subset(AKP_results_shrunk, !is.na(log2FoldChange))
+AKP_results_shrunk <- AKP_results_shrunk[order(AKP_results_shrunk$padj),]
+AKP_results_shrunk_uniq <- AKP_results_shrunk[!duplicated(AKP_results_shrunk$external_gene_name),]
+foldchangesAKP <- AKP_results_shrunk_uniq$log2FoldChange
+names(foldchangesAKP) <- AKP_results_shrunk_uniq$external_gene_name
+foldchangesAKP <- sort(foldchangesAKP, decreasing = TRUE)
+```
+
+
+# Gene Set Enrichment Analysis - Lgr5 ISC Gene Signature #
+```{r, eval=T}
+# Import Lgr5 ISC gene signature TERM TO GENE 
+ISCsig <- read_csv("~/Dropbox/Hippo in CRC/scrna-seq/ISC TERM2GENE.csv")
+
+# ApcKO 72h vs 0h - Figure 4I
+set.seed(100)
+msig72 <- GSEA(foldchanges72, TERM2GENE=ISCsig, verbose=FALSE, pvalueCutoff = 1)
+msig72_df <- data.frame(msig72)
+print("72h")
+print(msig72_df$NES)
+print(msig72_df$pvalue)
+enrichplot::gseaplot2(msig72, geneSetID = 'ISC', title = "Lgr5 ISC Gene Signature", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line") 
+
+# AKP +Dox D3 vs -Dox D3 - Figure 5E
+set.seed(41)
+msigAKP <- GSEA(foldchangesAKP, TERM2GENE=ISCsig, verbose=FALSE, pvalueCutoff = 1)
+msigAKP_df <- data.frame(msigAKP)
+print("AKP")
+print(msigAKP_df$NES)
+print(msigAKP_df$pvalue)
+enrichplot::gseaplot2(msigAKP, geneSetID = 'ISC', title = "Lgr5 ISC Gene Signature", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line")
+```
+
+
+# Gene Set Enrichment Analysis - YAP Gene Signatures #
+```{r, eval=T}
+# Import Barry et al. 2013 YAP gene signature TERM TO GENE
+Barry_YAP <- read.csv("~/Dropbox/Hippo in CRC/scrna-seq/Barry_YAP_sig.csv", header = T, stringsAsFactors = F)
+
+print("Barry")
+
+# ApcKO 24h vs 0h - Figure 4H
+set.seed(11)
+msig24 <- GSEA(foldchanges24, TERM2GENE=Barry_YAP, verbose=FALSE, pvalueCutoff = 1, maxGSSize = 10000)
+msig24_df <- data.frame(msig24)
+print("24h")
+print(msig24_df$NES)
+print(msig24_df$pvalue)
+enrichplot::gseaplot2(msig24, geneSetID = 'YAP', title = "Barry et al. 2013 YAP Gene Signature", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line")
+
+# AKP +Dox D3 vs -Dox D3 - Figure 5C
+set.seed(5)
+msigAKP <- GSEA(foldchangesAKP, TERM2GENE=Barry_YAP, verbose=FALSE, pvalueCutoff = 1, maxGSSize = 10000)
+msigAKP_df <- data.frame(msigAKP)
+print("AKP")
+print(msigAKP_df$NES)
+print(msigAKP_df$pvalue)
+enrichplot::gseaplot2(msigAKP, geneSetID = 'YAP', title = "Barry et al. 2013 YAP Gene Signature", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line") 
+
+
+# Import Gregorieff et al. 2015 YAP gene signature TERM TO GENE
+Gregorieff_YAP <- read.csv("~/Dropbox/Hippo in CRC/scrna-seq/Gregorieff_YAP_sig.csv", header = T, stringsAsFactors = F)
+
+print("Gregorieff")
+
+# ApcKO 24h vs 0h - Figure S4I
+set.seed(10)
+msig24 <- GSEA(foldchanges24, TERM2GENE=Gregorieff_YAP, verbose=FALSE, pvalueCutoff = 1, maxGSSize = 10000)
+msig24_df <- data.frame(msig24)
+print("24h")
+print(msig24_df$NES)
+print(msig24_df$pvalue)
+enrichplot::gseaplot2(msig24, geneSetID = 'YAP', title = "Gregorieff et al. 2015 YAP Gene Signature", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line") 
+
+# AKP +Dox D3 vs -Dox D3 - Figure S5B
+set.seed(1)
+msigAKP <- GSEA(foldchangesAKP, TERM2GENE=Gregorieff_YAP, verbose=FALSE, pvalueCutoff = 1, maxGSSize = 10000)
+msigAKP_df <- data.frame(msigAKP)
+print("AKP")
+print(msigAKP_df$NES)
+print(msigAKP_df$pvalue)
+enrichplot::gseaplot2(msigAKP, geneSetID = 'YAP', title = "Gregorieff et al. 2015 YAP Gene Signature", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line")
+```
+
+# Generate heatmap for expression of Wnt nuclear co-factors over time course - Figure S4K
+```{r, eval=T, fig.width=2.5, fig.height=1}
+wnt.factors <- as.data.frame(c("Tcf7", "Tcf7l1", "Tcf7l2", "Lef1", "Ctnnb1", "Bcl9", "Bcl9l", "Pygo2"))
+wnt.factors <- merge(wnt.factors, gene_id, by.x=1, by.y=2)
+df.wnt <- tcourse_vst[wnt.factors$ensembl_gene_id,]
+df.wnt <- merge(df.wnt, gene_id, by.x=0, by.y=1)
+row.names(df.wnt) <- df.wnt[,"external_gene_name"]
+df.wnt <- df.wnt[,-c(1,12,13)]
+colnames(df.wnt) <- tcourse_rnaseq$treatment
+wnt.factors.heatmap <- pheatmap(df.wnt, fontsize = 8, cluster_cols = F, scale="row")
+```
+
+
+# Differentially Expressed Transcription Factors in ApcKO 72h vs 0h #
+```{r, eval=T}
+# Transcription factors from CISBP v2.00
+mmu_TFv2 <- read.csv("CIS-BP-mmu-TF-v2.csv")
+mmu_TFv2 <- merge(mmu_TFv2, gene_id[,c(1,2)], by.x=4, by.y=1)
+mmu_TFv2_names <- unique(mmu_TFv2$external_gene_name)
+```
+
+
+```{r, eval=T}
+# Generating ranked TF list by gene symbol for GSEA
+tcourse_72_results_shrunk_tfs <- subset(tcourse_72_results_shrunk_uniq, external_gene_name %in% mmu_TFv2_names)
+
+tf.foldchanges72 <- tcourse_72_results_shrunk_tfs$log2FoldChange
+names(tf.foldchanges72) <- tcourse_72_results_shrunk_tfs$external_gene_name
+tf.foldchanges72 <- sort(tf.foldchanges72, decreasing = TRUE)
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=4.25}
+# Gene ontology overrepresentation analysis - Figure S4L
+all_tfs_entrez <- tcourse_72_results_entrez_tfs$entrezgene_id
+
+tf72UP <- subset(tcourse_72_results_entrez_tfs, padj < 0.05 & log2FoldChange > 1)$entrezgene_id
+tf72DOWN <- subset(tcourse_72_results_entrez_tfs, padj < 0.05 & log2FoldChange < -1)$entrezgene_id
+
+egotfUP <- enrichGO(gene = as.character(tf72UP), 
+                universe = as.character(all_tfs_entrez),
+                keyType = "ENTREZID",
+                OrgDb = org.Mm.eg.db, 
+                ont = "BP", 
+                pAdjustMethod = "BH", 
+                qvalueCutoff = 0.01, 
+                readable = TRUE)
+egotfDOWN <- enrichGO(gene = as.character(tf72DOWN), 
+                universe = as.character(all_tfs_entrez),
+                keyType = "ENTREZID",
+                OrgDb = org.Mm.eg.db, 
+                ont = "BP", 
+                pAdjustMethod = "BH", 
+                qvalueCutoff = 0.01, 
+                readable = TRUE)
+
+egotfUP_result <- egotfUP@result
+egotfDOWN_result <- egotfDOWN@result
+
+GOup <- data.frame(egotfUP_result[c(4,13,31),])
+GOup$GeneRatio <- as.numeric(unlist(strsplit(GOup$GeneRatio, "/"))[c(T,F)]) / as.numeric(unlist(strsplit(GOup$GeneRatio, "/"))[c(F,T)])
+unlist(strsplit(GOup[1,]$geneID, "/"))
+
+GOdown <- data.frame(egotfDOWN_result[1,])
+GOdown$GeneRatio <- as.numeric(unlist(strsplit(GOdown$GeneRatio, "/"))[c(T,F)]) / as.numeric(unlist(strsplit(GOdown$GeneRatio, "/"))[c(F,T)])
+unlist(strsplit(GOdown[1,]$geneID, "/"))
+
+GOup <- GOup[order(-GOup$Count),] 
+GOup$Order <- c(1,2,3)
+GOup$Description <- factor(GOup$Description, levels = GOup$Description[order(-GOup$Order)])
+
+ggplot(GOup, # you can replace the numbers to the row number of pathway of your interest
+             aes(x = GeneRatio, y = Description)) + 
+             geom_point(aes(size = Count, color = pvalue)) +
+             theme_bw(base_size = 16) +
+             theme(axis.text = element_text(vjust=0.5, size = 16), 
+                   axis.title=element_text(size=16), legend.text = element_text(size = 12), legend.title = element_text(size = 14)) +
+             #scale_color_continuous(low="red", high="blue", name = "p-value") +
+             scale_color_continuous(low="red", high="blue", name="p-value",
+                         breaks=c(0.05, 0.008, 0.005, 0.0005, 0.00001)) +
+             ylab(NULL) +
+             ggtitle("GO Biological Process")
+```
+
+
+```{r, eval=T}
+# Gene set enrichment analysis - intestinal beta-catenin targets - Figure S4M
+bcatsig <- read.csv(file = "Gene Signatures/Mouse_ISC_b-cat_Targets.csv", header = T, stringsAsFactors = F)
+
+set.seed(33)
+
+msigtf <- GSEA(tf.foldchanges72, TERM2GENE=bcatsig, verbose=FALSE, pvalueCutoff = 1)
+msigtf_df <- data.frame(msigtf)
+print("72h")
+print(msigtf_df$NES)
+print(msigtf_df$pvalue)
+enrichplot::gseaplot2(msigtf, geneSetID = 'Bcat', title = "Intestinal Beta-catenin Targets", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line")
+```

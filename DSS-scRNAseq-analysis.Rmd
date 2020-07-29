@@ -1,0 +1,446 @@
+---
+title: "DSS-scRNAseq-analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(sctransform)
+library(biomaRt)
+library(KEGGREST)
+library(fgsea)
+library(clusterProfiler)
+```
+
+
+# Read in count matrices #
+```{r, eval=T}
+# Read in COL (control colon) data
+ctrl.data <- read.table("COL.counts.tsv.gz", sep = "\t", stringsAsFactors = FALSE, header=T)
+row.names(ctrl.data) <- ctrl.data$barcode  # make the barcodes the row names of the data frame
+ctrl.data <- ctrl.data[,-1]  # remove 1 column
+ctrl.data.t <- t(ctrl.data)  # transpose data frame to get cells (columns) x genes (rows)
+
+# Read in DSS data
+dss.data <- read.table("DSS.counts.tsv.gz", sep = "\t", stringsAsFactors = FALSE, header=T)
+row.names(dss.data) <- dss.data$barcode
+dss.data <- dss.data[,-1]
+dss.data.t <- t(dss.data)
+```
+
+
+```{r, eval=T}
+# Initialize the Seurat object with the raw non-normalized data
+ctrl <- CreateSeuratObject(ctrl.data.t, project = "COL", min.cells = 3, min.features = 200)
+dss <- CreateSeuratObject(dss.data.t, project = "DSS", min.cells = 3, min.features = 200)
+```
+
+
+```{r, eval=T}
+# Generate quality metrics #
+# Determine percent counts from mitochondrial genes
+ctrl[["percent.mt"]] <- PercentageFeatureSet(ctrl, pattern = "^mt.")
+dss[["percent.mt"]] <- PercentageFeatureSet(dss, pattern = "^mt.")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(ctrl, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(dss, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# Merge Seurat objects
+dss.combined <- merge(ctrl, y=dss, add.cell.ids = c("ctrl", "dss"), project = "DSS")
+
+# Add number of genes per UMI for each cell to metadata
+dss.combined$log10GenesPerUMI <- log10(dss.combined$nFeature_RNA) / log10(dss.combined$nCount_RNA)
+
+# Compute percent mito ratio
+dss.combined$mitoRatio <- dss.combined@meta.data$percent.mt / 100
+
+# Create metadata dataframe
+metadata <- dss.combined@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^ctrl_"))] <- "ctrl"
+metadata$sample[which(str_detect(metadata$cells, "^dss_"))] <- "dss"
+
+# Add metadata back to Seurat object
+dss.combined@meta.data <- metadata
+```
+
+
+```{r, eval=T}
+# Assess quality metrics #
+# Visualize the number of cell counts per cell
+metadata %>% 
+  	ggplot(aes(x=sample, fill=sample)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 300)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 300)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 300) +
+  	facet_wrap(~sample)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.2)
+
+# Visualize the overall novelty of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.8)
+```
+
+
+```{r, eval=T}
+# Filter and normalize cells #
+set.seed(79)
+
+# Filter out low quality reads using selected thresholds 
+dss.combined.filtered <- subset(x = dss.combined, 
+                                 subset = (nUMI >= 300) &
+                                   (nGene >= 300) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.15),
+                                seed = 10)
+
+#dss.list <- SplitObject(object = dss.combined.filtered, split.by = "sample")
+
+# Downsample the number of cells in each sample to the sample with the fewest cells
+dss.combined.filtered <- subset(x = dss.combined.filtered, downsample = 1097, seed = 1)
+```
+
+
+
+```{r, eval=T}
+# Re-assess QC metrics #
+# Create metadata dataframe
+metadata <- dss.combined.filtered@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Visualize the number of cell counts per cell
+metadata %>% 
+  	ggplot(aes(x=sample, fill=sample)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 300)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 300)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 300) +
+  	geom_hline(yintercept = 300) +
+  	facet_wrap(~sample)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.15)
+
+# Visualize the overall novelty of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.8)
+```
+
+
+```{r, eval=T}
+# Count normalization via sctransform
+dss.combined.filtered <- SCTransform(dss.combined.filtered, verbose = FALSE)
+```
+
+
+```{r, eval=T}
+# Clustering #
+# Perform dimensionality reduction by PCA and UMAP embedding
+dss.combined.filtered <- RunPCA(dss.combined.filtered, verbose = FALSE)
+dss.combined.filtered <- RunUMAP(dss.combined.filtered, reduction = "pca", dims = 1:40)
+
+# Cluster the cells using K-nearest neighbor
+dss.combined.filtered <- FindNeighbors(dss.combined.filtered, reduction = "pca", dims = 1:40)
+dss.combined.filtered <- FindClusters(dss.combined.filtered, resolution = 1.4)
+```
+
+
+```{r, eval=T, fig.height=1.75, fig.width=2.2}
+# Visualize sample clustering - Figure S3C
+DimPlot(dss.combined.filtered, reduction = "umap", group.by = "sample")
+```
+
+
+```{r, eval=T, fig.height=1.75, fig.width=2.15}
+# Visualize subclusters - Figure S3D
+DimPlot(dss.combined.filtered, reduction = "umap")
+```
+
+
+```{r, eval=T}
+# Marker identification #
+# Select the RNA counts slot to be the default assay
+DefaultAssay(dss.combined.filtered) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+dss.combined.filtered <- NormalizeData(dss.combined.filtered, verbose = FALSE)
+
+# Find markers for every cluster compared to all remaining cells, reporting only the positive ones
+dss.markers <- FindAllMarkers(dss.combined.filtered, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Extract top 30 markers per cluster
+alltop30dss <- dss.markers %>% group_by(cluster) %>% top_n(n = 30, wt = avg_logFC)
+```
+
+
+```{r, eval=T, fig.height=7, fig.width=7.66}
+# Visualize expression of known marker genes - Figure S3F
+FeaturePlot(dss.combined.filtered, features = c("Lgr5", "Reg4", "Tff3", "Car1", "Car4", "Dclk1", "Chga" ), sort.cell = TRUE, min.cutoff = "q10", max.cutoff = "q90")
+```
+
+
+```{r, eval=T}
+# Annotate clusters 
+dss.combined.filtered.clusters <- RenameIdents(dss.combined.filtered, `0` = "Progenitor", `1` = "Colonocyte (Mature)", `2` = "Goblet", `3` = "Progenitor", `4` = "Colonocyte (Early)", `5` = "Goblet - DCS", `6` = "Stem", `7` = "Goblet - DCS", `8` = "Colonocyte (Early)", `9` = "Goblet", `10` = "Colonocyte (Mature)", `11` = "Goblet", `12` = "Enteroendocrine", `13` = "Tuft")
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=4.65}
+# Visualize with annotated clusters - Figure S3E
+DimPlot(dss.combined.filtered.clusters,
+        reduction = "umap", split.by = "sample",
+        order = c("Tuft", "Enteroendocrine", "Goblet", "Goblet - DCS", "Colonocyte (Mature)", "Colonocyte (Early)", "Progenitor", "Stem"))
+```
+
+
+```{r, eval=T, fig.height=1.9, fig.width=4.3}
+# Visualize expression of Ly6a/Sca1 - Figure S3G
+FeaturePlot(dss.combined.filtered.clusters, features = "Ly6a", sort.cell = T, split.by = "sample", min.cutoff = "q10", max.cutoff = "q90")
+```
+
+
+```{r, eval=T}
+# Differential Gene Expression Analysis #
+# Assign clusters by cell type
+dss.combined.filtered.de <- RenameIdents(dss.combined.filtered, `0` = "Progenitor", `1` = "Colonocyte", `2` = "Goblet", `3` = "Progenitor", `4` = "Colonocyte", `5` = "Goblet", `6` = "Stem", `7` = "Goblet", `8` = "Colonocyte", `9` = "Goblet", `10` = "Colonocyte", `11` = "Goblet", `12` = "Enteroendocrine", `13` = "Tuft")
+DimPlot(dss.combined.filtered.de, reduction = "umap")
+
+# Assign cell types to their respective treatment groups - DSS or control
+dss.combined.filtered.de$celltype.dss <- paste(Idents(dss.combined.filtered.de), dss.combined.filtered.de$sample, sep = "_")
+dss.combined.filtered.de$celltype <- Idents(dss.combined.filtered.de)
+Idents(dss.combined.filtered.de) <- "celltype.dss"
+
+# Identify differentially expressed genes between DSS and control colon by cell type
+dss.response.stem <- FindMarkers(dss.combined.filtered.de, ident.1 = "Stem_dss", ident.2 = "Stem_ctrl", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% add_column(celltype = "Stem")
+dss.response.colonocyte <- FindMarkers(dss.combined.filtered.de, ident.1 = "Colonocyte_dss", ident.2 = "Colonocyte_ctrl", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% add_column(celltype = "Colonocyte")
+dss.response.goblet <- FindMarkers(dss.combined.filtered.de, ident.1 = "Goblet_dss", ident.2 = "Goblet_ctrl", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% add_column(celltype = "Goblet")
+dss.response.tuft <- FindMarkers(dss.combined.filtered.de, ident.1 = "Tuft_dss", ident.2 = "Tuft_ctrl", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% add_column(celltype = "Tuft")
+dss.response.enteroendocrine <- FindMarkers(dss.combined.filtered.de, ident.1 = "Enteroendocrine_dss", ident.2 = "Enteroendocrine_ctrl", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% add_column(celltype = "Enteroendocrine")
+dss.response.progenitor <- FindMarkers(dss.combined.filtered.de, ident.1 = "Progenitor_dss", ident.2 = "Progenitor_ctrl", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% add_column(celltype = "Progenitor")
+
+# Concatenate results
+dss.response.all <- rbind(dss.response.stem, dss.response.colonocyte, dss.response.enteroendocrine, dss.response.goblet, dss.response.progenitor)
+#write.csv(dss.response.all, file = "2020-05-14_dss_allde.csv", row.names = FALSE)
+dss.response.all.uniq <- dss.response.all[,c(1,3)] %>% group_by(gene) %>% summarise_all(mean) %>% as.data.frame()
+
+# Filter differentially expressed genes with log2FC > 1 and adj p-value < 0.05 to generate a "DSS injury signature"
+dss.response.FC1 <- subset(dss.response.all, avg_logFC > 1 & p_val_adj < 0.05)
+#write.csv(dss.response.FC1, file = "2020-05-14_dss_de_padj005_lfc1.csv", row.names = FALSE)
+```
+
+
+```{r, eval=T}
+# Retrieve mouse KEGG pathways from KEGG database 
+library(KEGGREST)
+path <- gsub("mmu:","",keggLink("mmu","pathway"))
+path <- data.frame(pathway=names(path), gene=as.character(path))
+path <- split(as.character(path$gene), path$pathway)
+
+substrLeft <- function(x, n){
+  substr(x, 1, nchar(x)-n)
+}
+
+p <- c()
+for(i in 1:(length(path) %/% 10)){
+  p <- c(p, sapply(keggGet(names(path)[(i*10-9):(i*10)]), "[[", "NAME"))
+}
+i <- i + 1
+p <- c(p, sapply(keggGet(names(path)[(i*10-9):((i*10-9) + length(path) %% 10 - 1)]), "[[", "NAME"))
+p <- substrLeft(p,23)
+names(path) <- p
+```
+
+
+```{r, eval=T, fig.height=1.75, fig.width=3}
+# Gene Set Enrichment Analysis - KEGG Pathways - Figure 3D #
+# Acquire mouse Ensembl gene ids, gene symbols, and entrez gene ids from BioMart database
+gene_id <- getBM(attributes= c("ensembl_gene_id", "external_gene_name", "entrezgene_id"),
+                     mart = useDataset("mmusculus_gene_ensembl", useMart("ensembl")))
+
+# Generate differentially expressed gene list using entrez ids
+dss.response_entrez <- merge(dss.response.all.uniq, gene_id[,c(2,3)], by.x="gene", by.y="external_gene_name")
+dss.response_entrez <- subset(dss.response_entrez, !is.na(entrezgene_id))
+dss.response_entrez <- distinct(dss.response_entrez, entrezgene_id, .keep_all = TRUE)
+
+# Extract foldchanges
+foldchanges <- dss.response_entrez$avg_logFC
+
+# Name each fold change with  corresponding entrez ids
+names(foldchanges) <- dss.response_entrez$entrezgene_id
+
+# Sort fold changes in decreasing order
+foldchanges <- sort(foldchanges, decreasing = TRUE)
+
+set.seed(5)
+
+dss_fgsea_kegg.colonocyte <- fgsea(path, foldchanges.colonocyte, nperm=10000, maxSize=500)
+dss_fgsea_kegg.colonocyte <- dss_fgsea_kegg.colonocyte[order(dss_fgsea_kegg.colonocyte$padj),]
+dss_fgsea_kegg.stem <- fgsea(path, foldchanges.stem, nperm=10000, maxSize=500)
+dss_fgsea_kegg.stem <- dss_fgsea_kegg.stem[order(dss_fgsea_kegg.stem$padj),]
+dss_fgsea_kegg.progenitor <- fgsea(path, foldchanges.progenitor, nperm=10000, maxSize=500)
+dss_fgsea_kegg.progenitor <- dss_fgsea_kegg.progenitor[order(dss_fgsea_kegg.progenitor$padj),]
+
+dss_fgsea_kegg <- fgsea(path, foldchanges, nperm=10000, maxSize=500)
+dss_fgsea_kegg <- dss_fgsea_kegg[order(dss_fgsea_kegg$padj),]
+dss_fgsea_kegg$pathway <- factor(dss_fgsea_kegg$pathway, levels=rev(unique(dss_fgsea_kegg$pathway[order(dss_fgsea_kegg$NES)])))
+
+ggplot(subset(dss_fgsea_kegg[c(5,21,22,48),]), aes(y = NES, x = pathway)) + 
+  geom_segment(yend=0, aes(xend=pathway), lty=3) + theme_classic() + ylab("Normalized Enrichment Score") + 
+  geom_point(aes(size=size, color=(pval)))  +
+  xlab("Significant KEGG Pathways") + coord_flip() + 
+  theme(legend.position = "right", axis.text = element_text(vjust=0.5, size = 12),
+        axis.title=element_text(size=14)) +
+  guides(size=guide_legend(title="Gene Set Size")) +
+  scale_color_continuous(low="red", high="blue", name="p-value", trans = "log",
+                         breaks=c(0.05, 0.03, 0.01, 0.003, 0.001)) +
+  ylim(c(-0,3)) + geom_hline(yintercept=0, lwd=0.1)
+```
+
+
+```{r, eval=TRUE}
+# Gene Set Enrichment Analysis - Gene Signatures #
+# Extract the foldchanges
+foldchanges <- dss.response.all.uniq$avg_logFC
+
+# Name each fold change with the corresponding gene symbols
+names(foldchanges) <- dss.response.all.uniq$gene
+
+# Sort fold changes in decreasing order
+foldchanges <- sort(foldchanges, decreasing = TRUE)
+
+# GSEA of ISC Gene Signature in DSS vs Control - Figure 3E
+set.seed(1)
+ISCsig <- read.csv("Gene Signatures/ISC TERM2GENE.csv")
+msig <- GSEA(foldchanges, TERM2GENE=ISCsig, verbose=FALSE, pvalueCutoff = 1)
+msig_df <- data.frame(msig)
+enrichplot::gseaplot2(msig, geneSetID = 'ISC', title = "Lgr5 ISC Gene Signature", color = "green", base_size = 17,
+  rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE,
+  ES_geom = "line") 
+
+# GSEA of YAP Gene Signatures in DSS vs Control - Figure S3H-I
+set.seed(72)
+Barry_YAP <- read.csv("Gene Signatures/Barry_YAP_sig.csv", header = T, stringsAsFactors = F)
+msig_barry <- GSEA(foldchanges, TERM2GENE=Barry_YAP, verbose=FALSE, pvalueCutoff = 1, maxGSSize = 10000)
+msig_barry_df <- data.frame(msig_barry)
+enrichplot::gseaplot2(msig_barry, geneSetID = 'YAP', title = "Barry et al. 2013 YAP Gene Signature", color = "green", base_size = 17, rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE, ES_geom = "line")
+
+set.seed(15)
+Gregorieff_YAP <- read.csv(file = "Gene Signatures/Gregorieff_YAP_sig.csv", header = T, stringsAsFactors = F)
+msig_gregorieff <- GSEA(foldchanges, TERM2GENE=Gregorieff_YAP, verbose=FALSE, pvalueCutoff = 1, minGSSize = 0, maxGSSize = 10000)
+msig_gregorieff_df <- data.frame(msig_gregorieff)
+enrichplot::gseaplot2(msig_gregorieff, geneSetID = 'YAP', title = "Gregorieff et al. 2015 YAP Gene Signature", color = "green", base_size = 17, rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE, ES_geom = "line")
+```
+
+
+

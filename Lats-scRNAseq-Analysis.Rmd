@@ -1,0 +1,516 @@
+---
+title: "Lats-scRNAseq-analysis"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(sctransform)
+library(AnnotationHub)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+```
+
+
+```{r, eval=T}
+# Read in Count Matrices #
+# Read in C1 (control #1) data
+C1.data <- read.table("C1.counts.tsv.gz", sep = "\t", stringsAsFactors = FALSE, header=T)
+row.names(C1.data) <- C1.data$barcode
+C1.data <- C1.data[,-1]
+C1.data.t <- t(C1.data) 
+
+# Read in C2 (control #2) data
+C2.data <- read.table("C2.counts.tsv.gz", sep = "\t", stringsAsFactors = FALSE, header=T)
+row.names(C2.data) <- C2.data$barcode
+C2.data <- C2.data[,-1]
+C2.data.t <- t(C2.data) 
+
+# Read in L1 (Lats1/2 cKO #1) data
+L1.data <- read.table("L1.counts.tsv.gz", sep = "\t", stringsAsFactors = FALSE, header=T)
+row.names(L1.data) <- L1.data$barcode
+L1.data <- L1.data[,-1]
+L1.data.t <- t(L1.data) 
+
+# Read in L2 (Lats1/2 cKO #2) data
+L2.data <- read.table("L2.counts.tsv.gz", sep = "\t", stringsAsFactors = FALSE, header=T)
+row.names(L2.data) <- L2.data$barcode
+L2.data <- L2.data[,-1]
+L2.data.t <- t(L2.data) 
+```
+
+
+```{r, eval=T}
+# Initialize Seurat objects with raw non-normalized data
+C1 <- CreateSeuratObject(C1.data.t, project = "C1", min.cells = 3, min.features = 200)
+C2 <- CreateSeuratObject(C2.data.t, project = "C2", min.cells = 3, min.features = 200)
+L1 <- CreateSeuratObject(L1.data.t, project = "L1", min.cells = 3, min.features = 200)
+L2 <- CreateSeuratObject(L2.data.t, project = "L2", min.cells = 3, min.features = 200)
+```
+
+
+```{r, eval=T}
+# Generate Quality Metrics #
+# Determine percent counts from mitochondrial genes
+C1[["percent.mt"]] <- PercentageFeatureSet(C1, pattern = "^mt.")
+C2[["percent.mt"]] <- PercentageFeatureSet(C2, pattern = "^mt.")
+L1[["percent.mt"]] <- PercentageFeatureSet(L1, pattern = "^mt.")
+L2[["percent.mt"]] <- PercentageFeatureSet(L2, pattern = "^mt.")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(C1, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(C2, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(L1, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(L2, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# Merge Seurat objects
+lats.combined <- merge(C1, y=c(C2, L1, L2), add.cell.ids = c("C1", "C2", "L1", "L2"), project = "Lats")
+
+# Add number of genes per UMI for each cell to metadata
+lats.combined$log10GenesPerUMI <- log10(lats.combined$nFeature_RNA) / log10(lats.combined$nCount_RNA)
+
+# Compute percent mito ratio
+lats.combined$mitoRatio <- lats.combined@meta.data$percent.mt / 100
+
+# Create metadata dataframe
+metadata <- lats.combined@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>% 
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^C1_"))] <- "C1"
+metadata$sample[which(str_detect(metadata$cells, "^C2_"))] <- "C2"
+metadata$sample[which(str_detect(metadata$cells, "^L1_"))] <- "L1"
+metadata$sample[which(str_detect(metadata$cells, "^L2_"))] <- "L2"
+
+# Add metadata back to Seurat object
+lats.combined@meta.data <- metadata
+```
+
+
+```{r, eval=T}
+# Assess Quality Metrics #
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=sample, fill=sample)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 600)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 250)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 250) +
+  	facet_wrap(~sample)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.15)
+
+# Visualize the overall novelty of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.8)
+```
+
+
+```{r, eval=T}
+# Filter and Normalize Cells #
+set.seed(73)
+
+# Filter out low quality reads using selected thresholds
+lats.combined.filtered <- subset(x = lats.combined, 
+                                 subset = (nUMI >= 600) &
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.15),
+                                 seed = 1)
+
+lats.list <- SplitObject(object = lats.combined.filtered, split.by = "sample")
+
+# Downsample the number of cells in each sample to the sample with the fewest cells
+lats.combined.filtered <- subset(x = lats.combined.filtered, downsample = length(lats.list$C2@active.ident), seed = 1000)
+```
+
+
+```{r, eval=T}
+# Re-assess QC Metrics #
+# Create metadata dataframe
+metadata <- lats.combined.filtered@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=sample, fill=sample)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell 
+metadata %>% 
+    ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 600)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 250)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 250) +
+  	facet_wrap(~sample)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.15)
+
+# Visualize the overall novelty of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.8)
+```
+
+
+```{r, eval=T}
+# Count normalization via sctransform
+lats.combined.filtered <- SCTransform(lats.combined.filtered, verbose = FALSE)
+```
+
+
+```{r, eval=T}
+# Clustering #
+# Perform dimensionality reduction by PCA and UMAP embedding
+lats.combined.filtered <- RunPCA(lats.combined.filtered, verbose = FALSE)
+lats.combined.filtered <- RunUMAP(lats.combined.filtered, reduction = "pca", dims = 1:40)
+
+# Cluster the cells using K-nearest neighbor
+lats.combined.filtered <- FindNeighbors(lats.combined.filtered, reduction = "pca", dims = 1:40)
+lats.combined.filtered <- FindClusters(lats.combined.filtered, resolution = 1.4)
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=2.7}
+# Visualize sample clustering - Figure S1B
+DimPlot(lats.combined.filtered, reduction = "umap", group.by = "sample")
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=2.65}
+# Visualize subclusters - Figure S1C
+DimPlot(lats.combined.filtered, reduction = "umap")
+```
+
+
+```{r, eval=T}
+# Marker identification #
+# Select the RNA counts slot to be the default assay
+DefaultAssay(lats.combined.filtered) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+lats.combined.filtered <- NormalizeData(lats.combined.filtered)
+
+# Find markers for every cluster compared to all remaining cells, reporting only the positive ones
+lats.markers <- FindAllMarkers(lats.combined.filtered, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Extract top 30 markers per cluster
+alltop30lats <- lats.markers %>% group_by(cluster) %>% top_n(n = 30, wt = avg_logFC)
+```
+
+
+```{r, eval=T, fig.height=4, fig.width=7.05}
+# Visualize expression of known marker genes - Figure S1D
+FeaturePlot(lats.combined.filtered, features = c("Ascl2", "Dmbt1", "Chgb", "Vim", "Reg1", "Alpi", "Vil1", "Cdx2", "Tff3", "Lyz1"), min.cutoff = "q10", max.cutoff = "q90", sort.cell = T, pt.size = 0.5)
+```
+
+
+```{r, eval=T}
+# Annotate clusters 
+lats.combined.filtered.clusters <- RenameIdents(lats.combined.filtered, `0` = "Mature Enterocyte", `1` = "Transit Amplifying", `2` = "Lats1/2 KO", `3` = "Lats1/2 KO", `4` = "Lats1/2 KO", `5` = "Lats1/2 KO", `6` = "Stem", `7` = "Enterocyte Progenitor", `8` = "Mature Enterocyte", `9` = "Goblet", `10` = "Lats1/2 KO", `11` = "Lats1/2 KO", `12` = "Lats1/2 KO", `13` = "Mesenchymal", `14` = "Lats1/2 KO", `15` = "Enteroendocrine")
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=3.4}
+# Visualize with annotated clusters - Figure 1A
+DimPlot(object = lats.combined.filtered.clusters, 
+        reduction = "umap", 
+        label = F,
+        order = c("Mesenchymal", "Enteroendocrine", "Goblet", "Mature Enterocyte", "Enterocyte Progenitor", "Transit Amplifying", "Stem", "Lats1/2 KO"))
+```
+
+
+```{r, eval=T}
+# Acquire Mouse Gene Annotations #
+# Connect to AnnotationHub
+ah <- AnnotationHub()
+
+# Access the Ensembl database for mouse
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+
+# Acquire the latest annotation files
+id <- ahDb %>%
+        mcols() %>%
+        rownames() %>%
+        tail(n = 1)
+
+# Download the appropriate Ensembldb database
+edb <- ah[[id]]
+
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame")
+
+# Select annotations of interest
+annotations <- annotations %>%
+        dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=3.5}
+# Differential Gene Expression Analysis #
+# Assign clusters as Lats, Control or Mesenchymal 
+lats.combined.filtered.allde <- RenameIdents(lats.combined.filtered, `0` = "Control", `1` = "Control", `2` = "Lats", `3` = "Lats", `4` = "Lats", `5` = "Lats", `6` = "Control", `7` = "Control", `8` = "Control", `9` = "Control", `10` = "Lats", `11` = "Lats", `12` = "Lats", `13` = "Mesenchymal", `14` = "Lats", `15` = "Control")
+DimPlot(lats.combined.filtered.allde, label = TRUE)
+
+# Assign clusters as Stem Cell, Lats, Control, or Mesenchymal 
+lats.combined.filtered.stemde <- RenameIdents(lats.combined.filtered, `0` = "Control", `1` = "Control", `2` = "Lats", `3` = "Lats", `4` = "Lats", `5` = "Lats", `6` = "Stem Cell", `7` = "Control", `8` = "Control", `9` = "Control", `10` = "Lats", `11` = "Lats", `12` = "Lats", `13` = "Mesenchymal", `14` = "Lats", `15` = "Control")
+DimPlot(lats.combined.filtered.stemde, label = TRUE)
+
+# Identify differentially expressed genes between Lats and control cells
+lats.response <- FindMarkers(lats.combined.filtered.allde, ident.1 = "Lats", ident.2 = "Control", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% left_join(y = unique(annotations[, c("gene_name", "description")]), by = c("gene" = "gene_name"))
+lats.response <- distinct(lats.response, gene, .keep_all = TRUE)
+#write.csv(lats.response, file = "2020-05-12_lats_allde.csv", row.names = FALSE)
+
+# Identify differentially expressed genes between Lats and stem cells
+lats.response.stem <- FindMarkers(lats.combined.filtered.stemde, ident.1 = "Lats", ident.2 = "Stem Cell", verbose = FALSE, test.use = "bimod") %>% rownames_to_column("gene") %>% left_join(y = unique(annotations[, c("gene_name", "description")]), by = c("gene" = "gene_name"))
+lats.response.stem <- distinct(lats.response.stem, gene, .keep_all = TRUE)
+#write.csv(lats.response.stem, file = "2020-05-12_lats_stemde.csv", row.names = FALSE)
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=4.25}
+# Gene Ontology Overrepresentation Analysis (Lats vs Control) #
+# Acquire mouse Ensembl gene ids, gene symbols, and entrez gene ids from BioMart database
+gene_id <- getBM(attributes= c("ensembl_gene_id", "external_gene_name", "entrezgene_id"),
+                 mart = useDataset("mmusculus_gene_ensembl", useMart("ensembl")))
+
+# Generate background gene list
+all_genes <- as.data.frame(lats.combined.filtered@assays[["RNA"]]@data@Dimnames[[1]])
+colnames(all_genes) <- "gene"
+all_genes_entrez <- merge(all_genes, gene_id[,c(2,3)], by.x="gene", by.y="external_gene_name")
+all_genes_entrez <- subset(all_genes_entrez, !is.na(entrezgene_id))
+all_genes_entrez <- unique(all_genes_entrez)
+all_genes_entrez <- all_genes_entrez$entrezgene_id
+
+# Generate upregulated and downregulated gene lists using entrez ids
+lats.response_entrez <- merge(lats.response, gene_id[,c(2,3)], by.x="gene", by.y="external_gene_name")
+lats.response_entrez <- subset(lats.response_entrez, !is.na(entrezgene_id))
+lats.response_entrez <- distinct(lats.response_entrez, entrezgene_id, .keep_all = TRUE)
+lats.response_entrezUP <- lats.response_entrez %>% subset(p_val_adj < 0.05 & avg_logFC > 1)
+lats.response_entrezDOWN <- lats.response_entrez %>% subset(p_val_adj < 0.05 & avg_logFC < -1)
+genesUP <- lats.response_entrezUP$entrezgene_id
+genesDOWN <- lats.response_entrezDOWN$entrezgene_id
+
+# Perform GO enrichment analysis on upregulated and downregulated genes
+egoUP <- enrichGO(gene = as.character(genesUP), 
+                  universe = as.character(all_genes_entrez),
+                  keyType = "ENTREZID",
+                  OrgDb = org.Mm.eg.db, 
+                  ont = "BP", 
+                  pAdjustMethod = "BH", 
+                  qvalueCutoff = 0.01,
+                  readable = TRUE)
+egoDOWN <- enrichGO(gene = as.character(genesDOWN),
+                    universe = as.character(all_genes_entrez),
+                    keyType = "ENTREZID",
+                    OrgDb = org.Mm.eg.db, 
+                    ont = "BP",
+                    pAdjustMethod = "BH",
+                    qvalueCutoff = 0.01,
+                    readable = TRUE)
+
+# Extract results of GO enrichment analysis
+egoUP_result <- egoUP@result
+egoDOWN_result <- egoDOWN@result
+
+# Extract upregulated GO terms
+GOup <- data.frame(egoUP_result[c(1,3,4,12,13,14,25,58),])
+GOup$GeneRatio <- as.numeric(unlist(strsplit(GOup$GeneRatio, "/"))[c(T,F)]) / as.numeric(unlist(strsplit(GOup$GeneRatio, "/"))[c(F,T)])
+unlist(strsplit(GOup[1,]$geneID, "/"))
+
+# Extract downregulated GO terms
+GOdown <- data.frame(egoDOWN_result[c(2,6,40),])
+GOdown$GeneRatio <- as.numeric(unlist(strsplit(GOdown$GeneRatio, "/"))[c(T,F)]) / as.numeric(unlist(strsplit(GOdown$GeneRatio, "/"))[c(F,T)])
+unlist(strsplit(GOdown[1,]$geneID, "/"))
+
+# Plot GO terms - Figure 1B
+GOup <- GOup[order(-GOup$Count),] 
+GOdown <- GOdown[order(-GOdown$Count),] 
+GOall <- rbind(GOup, GOdown)
+GOall$Order <- c(1,2,3,4,5,6,7,8,9,10,11)
+GOall$Description <- factor(GOall$Description, levels = GOall$Description[order(-GOall$Order)])
+ggplot(GOall,
+  aes(x = GeneRatio, y = Description)) +
+  geom_point(aes(size = Count, color = pvalue)) +
+  theme_bw(base_size = 12) +
+  theme(axis.text = element_text(vjust=0.5, size = 14), axis.title=element_text(size=14), legend.text = element_text(size = 12), legend.title = element_text(size = 14)) +
+  scale_color_continuous(low="red", high="blue") +
+  ylab(NULL) +
+  ggtitle("GO Biological Process")
+```
+
+
+```{r, eval=T}
+# Gene Set Enrichment Analysis #
+# Extract foldchanges
+foldchanges <- lats.response$avg_logFC
+foldchanges.stem <- lats.response.stem$avg_logFC
+
+# Name each fold change with the corresponding gene symbols
+names(foldchanges) <- lats.response$gene
+names(foldchanges.stem) <- lats.response.stem$gene
+
+# Sort fold changes in decreasing order
+foldchanges <- sort(foldchanges, decreasing = TRUE)
+foldchanges.stem <- sort(foldchanges.stem, decreasing = TRUE)
+
+set.seed(10)
+
+# GSEA of YAP Gene Signatures in Lats vs Control - Figure S1E-F
+Barry_YAP <- read.csv("Gene Signatures/Barry_YAP_sig.csv", header = T, stringsAsFactors = F)
+msig_barry <- GSEA(foldchanges, TERM2GENE=Barry_YAP, verbose=FALSE, pvalueCutoff = 1, maxGSSize = 10000)
+msig_barry_df <- data.frame(msig_barry)
+enrichplot::gseaplot2(msig_barry, geneSetID = 'YAP', title = "Barry et al. 2013 YAP Gene Signature", color = "green", base_size = 17, rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE, ES_geom = "line")
+
+Gregorieff_YAP <- read.csv(file = "Gene Signatures/Gregorieff_YAP_sig.csv", header = T, stringsAsFactors = F)
+msig_gregorieff <- GSEA(foldchanges, TERM2GENE=Gregorieff_YAP, verbose=FALSE, pvalueCutoff = 1, minGSSize = 0, maxGSSize = 10000)
+msig_gregorieff_df <- data.frame(msig_gregorieff)
+enrichplot::gseaplot2(msig_gregorieff, geneSetID = 'YAP', title = "Gregorieff et al. 2015 YAP Gene Signature", color = "green", base_size = 17, rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE, ES_geom = "line")
+
+# GSEA of Intestinal B-catenin Targets in Lats vs Stem Cells - Figure 1C
+bcatsig <- read.csv(file = "Gene Signatures/Mouse_ISC_b-cat_Targets.csv", header = T, stringsAsFactors = F)
+msig_bcat <- GSEA(foldchanges.stem, TERM2GENE=bcatsig, verbose=FALSE, pvalueCutoff = 1)
+msig_bcat_df <- data.frame(msig_bcat)
+enrichplot::gseaplot2(msig_bcat, geneSetID = 'Bcat', title = "Intestinal Beta-catenin Targets", color = "green", base_size = 17, rel_heights = c(1.5, 0.5, 1), subplots = 1:2, pvalue_table = FALSE, ES_geom = "line")
+```
+
+
+```{r, eval=T, fig.height=4, fig.width=5.05}
+# Visualize expression of indicated genes - Figure 1D
+FeaturePlot(lats.combined.filtered, features = c("Amotl2", "Ly6a", "Klf6"), min.cutoff = "q10", max.cutoff = "q90", sort.cell = TRUE)
+```
+
+
+```{r, eval=T, fig.height=2, fig.width=2.65}
+# Visualize Expression of DSS Injury Signature - Figure 3F #
+# Import DSS injury signature
+DSS_sig <- read.csv(file = "Gene Signatures/DSS-Injury-Signature.csv", header = T)
+
+# Select genes of interest
+gene.set <- DSS_sig$gene %>% unique() %>% as.character()
+
+# Get mean expression of DSS signature genes per cell
+mean.exp <- log2(colMeans(x = lats.combined.filtered@assays$RNA@data[gene.set, ], na.rm = TRUE, dims = 1)+1)
+
+# Add mean expression values in 'object@meta.data$gene.set.score'
+if (all(names(x = mean.exp) == rownames(x = lats.combined.filtered@meta.data))) {
+  cat("Cell names order match in 'mean.exp' and 'lats.combined.filtered@meta.data':\n", 
+      "adding gene set mean expression values in 'lats.combined.filtered@meta.data$gene.set.score'")
+  lats.combined.filtered@meta.data$gene.set.score <- mean.exp
+}
+
+# Plot mean expression using Seurat::FeaturePlot()
+FeaturePlot(object = lats.combined.filtered, features = "gene.set.score", sort.cell = F) + labs(title = "DSS Injury Signature")
+```
+
+
+
